@@ -28,4 +28,8 @@ pub enum CircuitBreakerError {
     ZeroOutflow,
     #[msg("Lockout period active — breaker cannot be reset yet")]
     LockoutActive,
+    #[msg("Policy change delay not elapsed")]
+    PolicyChangeDelayNotElapsed,
+    #[msg("No pending policy change to execute")]
+    NoPendingChange,
 }

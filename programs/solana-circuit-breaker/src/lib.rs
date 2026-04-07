@@ -28,15 +28,13 @@ pub mod solana_circuit_breaker {
         register_vault::handler(ctx, params)
     }
 
-    /// Check if an outflow is allowed. Call this before every withdrawal/transfer.
-    /// Trips the breaker automatically if limits are exceeded.
-    /// Check if an outflow is allowed. Returns 0 if allowed, non-zero if blocked.
-    /// Always succeeds so trip state persists. Protocol MUST check return value.
+    /// Check if an outflow is allowed. Errors when blocked — protocols cannot ignore.
+    /// On success, records the outflow in the rolling window.
     pub fn check_outflow(
         ctx: Context<CheckOutflow>,
         amount: u64,
         current_tvl: u64,
-    ) -> Result<u8> {
+    ) -> Result<()> {
         check_outflow::handler(ctx, amount, current_tvl)
     }
 
@@ -50,11 +48,25 @@ pub mod solana_circuit_breaker {
         reset_breaker::handler(ctx)
     }
 
-    /// Update vault policy parameters.
+    /// Update vault policy. Tightening applies immediately, loosening is queued.
     pub fn update_policy(
         ctx: Context<UpdatePolicy>,
         params: UpdatePolicyParams,
     ) -> Result<()> {
         update_policy::handler(ctx, params)
+    }
+
+    /// Transfer policy_authority and/or breaker_authority to new keys.
+    pub fn transfer_authority(
+        ctx: Context<TransferAuthority>,
+        new_policy_authority: Option<Pubkey>,
+        new_breaker_authority: Option<Pubkey>,
+    ) -> Result<()> {
+        transfer_authority::handler(ctx, new_policy_authority, new_breaker_authority)
+    }
+
+    /// Execute a queued policy loosening after the timelock delay.
+    pub fn execute_pending_policy(ctx: Context<ExecutePendingPolicy>) -> Result<()> {
+        execute_pending_policy::handler(ctx)
     }
 }

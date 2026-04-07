@@ -2,19 +2,7 @@ use anchor_lang::prelude::*;
 
 use crate::constants::{BPS_DENOMINATOR, VAULT_POLICY_SEED};
 use crate::error::CircuitBreakerError;
-use crate::state::{BreakerTrippedEvent, OutflowCheckedEvent, VaultPolicy};
-
-/// Return codes from check_outflow:
-/// 0 = allowed, outflow recorded
-/// 1 = blocked — breaker was already tripped
-/// 2 = blocked — single tx limit exceeded, breaker now tripped
-/// 3 = blocked — window rate limit exceeded, breaker now tripped
-/// 4 = blocked — vault is paused
-pub const OUTFLOW_ALLOWED: u8 = 0;
-pub const OUTFLOW_BLOCKED_TRIPPED: u8 = 1;
-pub const OUTFLOW_BLOCKED_SINGLE_TX: u8 = 2;
-pub const OUTFLOW_BLOCKED_WINDOW: u8 = 3;
-pub const OUTFLOW_BLOCKED_PAUSED: u8 = 4;
+use crate::state::{OutflowCheckedEvent, VaultPolicy};
 
 #[derive(Accounts)]
 pub struct CheckOutflow<'info> {
@@ -32,31 +20,29 @@ pub struct CheckOutflow<'info> {
     pub vault_policy: Account<'info, VaultPolicy>,
 }
 
-/// Check if an outflow is allowed. Always succeeds so trip state persists on-chain.
-/// Returns a code: 0 = allowed, non-zero = blocked (see constants above).
-/// Protocols MUST check the return value and abort the withdrawal if non-zero.
-pub fn handler(ctx: Context<CheckOutflow>, amount: u64, current_tvl: u64) -> Result<u8> {
+/// Check if an outflow is allowed. Errors when blocked — protocols cannot ignore it.
+/// On success, records the outflow in the rolling window.
+/// On failure (limits exceeded or breaker tripped), the tx rolls back — no state changes.
+pub fn handler(ctx: Context<CheckOutflow>, amount: u64, current_tvl: u64) -> Result<()> {
     let policy = &mut ctx.accounts.vault_policy;
     let clock = Clock::get()?;
     let now = clock.unix_timestamp;
 
     // Check if vault is admin-paused
-    if policy.paused {
-        return Ok(OUTFLOW_BLOCKED_PAUSED);
-    }
+    require!(!policy.paused, CircuitBreakerError::VaultPaused);
 
-    // Check if breaker is tripped
+    // Check if breaker is tripped (via manual trip or previous auto-trip that persisted)
     if policy.tripped {
         let elapsed = now.saturating_sub(policy.tripped_at);
 
         // For auto-trips, enforce lockout period
         if policy.auto_tripped && elapsed < policy.lockout_seconds as i64 {
-            return Ok(OUTFLOW_BLOCKED_TRIPPED);
+            return Err(CircuitBreakerError::BreakerTripped.into());
         }
 
         // After lockout (or for manual trips), check cooldown
         if elapsed < policy.cooldown_seconds as i64 {
-            return Ok(OUTFLOW_BLOCKED_TRIPPED);
+            return Err(CircuitBreakerError::BreakerTripped.into());
         }
 
         // Cooldown expired — auto-reset
@@ -78,39 +64,29 @@ pub fn handler(ctx: Context<CheckOutflow>, amount: u64, current_tvl: u64) -> Res
         .ok_or(CircuitBreakerError::MathOverflow)?
         / BPS_DENOMINATOR as u128;
 
-    if amount as u128 > max_single {
-        policy.tripped = true;
-        policy.tripped_at = now;
-        policy.auto_tripped = true;
-        policy.trip_count = policy.trip_count.saturating_add(1);
-
-        emit!(BreakerTrippedEvent {
-            vault: policy.vault,
-            protocol_authority: policy.policy_authority,
-            outflow_amount: amount,
-            tvl: current_tvl,
-            window_index: u8::MAX,
-            timestamp: now,
-        });
-
-        return Ok(OUTFLOW_BLOCKED_SINGLE_TX);
-    }
+    require!(
+        (amount as u128) <= max_single,
+        CircuitBreakerError::MaxSingleOutflowExceeded
+    );
 
     // Check 2: Rolling window rate limits
+    // First pass: validate all windows BEFORE updating any state.
+    // This ensures no partial state changes if a later window fails.
     let num_windows = policy.windows.len();
+    let mut new_cumulatives = Vec::with_capacity(num_windows);
+
     for i in 0..num_windows {
         let window_seconds = policy.windows[i].window_seconds;
         let max_outflow_bps = policy.windows[i].max_outflow_bps;
 
         let window_elapsed = now.saturating_sub(policy.window_states[i].window_start);
+        let current_cumulative = if window_elapsed >= window_seconds as i64 {
+            0 // window expired, will reset
+        } else {
+            policy.window_states[i].cumulative_outflow
+        };
 
-        if window_elapsed >= window_seconds as i64 {
-            policy.window_states[i].cumulative_outflow = 0;
-            policy.window_states[i].window_start = now;
-        }
-
-        let new_cumulative = policy.window_states[i]
-            .cumulative_outflow
+        let new_cumulative = current_cumulative
             .checked_add(amount)
             .ok_or(CircuitBreakerError::MathOverflow)?;
 
@@ -119,25 +95,23 @@ pub fn handler(ctx: Context<CheckOutflow>, amount: u64, current_tvl: u64) -> Res
             .ok_or(CircuitBreakerError::MathOverflow)?
             / BPS_DENOMINATOR as u128;
 
-        if new_cumulative as u128 > max_window_outflow {
-            policy.tripped = true;
-            policy.tripped_at = now;
-            policy.auto_tripped = true;
-            policy.trip_count = policy.trip_count.saturating_add(1);
+        require!(
+            (new_cumulative as u128) <= max_window_outflow,
+            CircuitBreakerError::RateLimitExceeded
+        );
 
-            emit!(BreakerTrippedEvent {
-                vault: policy.vault,
-                protocol_authority: policy.policy_authority,
-                outflow_amount: amount,
-                tvl: current_tvl,
-                window_index: i as u8,
-                timestamp: now,
-            });
+        new_cumulatives.push(new_cumulative);
+    }
 
-            return Ok(OUTFLOW_BLOCKED_WINDOW);
+    // Second pass: all windows passed — commit the state changes
+    for i in 0..num_windows {
+        let window_seconds = policy.windows[i].window_seconds;
+        let window_elapsed = now.saturating_sub(policy.window_states[i].window_start);
+
+        if window_elapsed >= window_seconds as i64 {
+            policy.window_states[i].window_start = now;
         }
-
-        policy.window_states[i].cumulative_outflow = new_cumulative;
+        policy.window_states[i].cumulative_outflow = new_cumulatives[i];
     }
 
     emit!(OutflowCheckedEvent {
@@ -147,5 +121,5 @@ pub fn handler(ctx: Context<CheckOutflow>, amount: u64, current_tvl: u64) -> Res
         timestamp: now,
     });
 
-    Ok(OUTFLOW_ALLOWED)
+    Ok(())
 }

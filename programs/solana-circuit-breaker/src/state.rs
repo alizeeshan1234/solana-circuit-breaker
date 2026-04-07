@@ -79,6 +79,17 @@ pub struct VaultPolicy {
     /// Admin can pause vault manually
     pub paused: bool,
 
+    // --- Timelock for policy changes ---
+    /// Delay (seconds) before policy loosening takes effect. 0 = no timelock.
+    /// Tightening limits always applies immediately (safer direction).
+    pub policy_change_delay: u32,
+    /// Pending max_single_outflow_bps (0 = no pending change)
+    pub pending_max_single_outflow_bps: u16,
+    /// Pending cooldown_seconds (0 = no pending change)
+    pub pending_cooldown_seconds: u32,
+    /// When the pending change was proposed (unix timestamp)
+    pub pending_change_at: i64,
+
     /// PDA bump
     pub bump: u8,
 }
@@ -108,5 +119,28 @@ pub struct OutflowCheckedEvent {
     pub vault: Pubkey,
     pub amount: u64,
     pub tvl: u64,
+    pub timestamp: i64,
+}
+
+/// Event emitted when vault policy is updated.
+#[event]
+pub struct PolicyUpdatedEvent {
+    pub vault: Pubkey,
+    pub policy_authority: Pubkey,
+    pub max_single_outflow_bps: u16,
+    pub cooldown_seconds: u32,
+    pub lockout_seconds: u32,
+    pub paused: bool,
+    pub timestamp: i64,
+}
+
+/// Event emitted when authority is transferred.
+#[event]
+pub struct AuthorityTransferredEvent {
+    pub vault: Pubkey,
+    pub old_policy_authority: Pubkey,
+    pub new_policy_authority: Pubkey,
+    pub old_breaker_authority: Pubkey,
+    pub new_breaker_authority: Pubkey,
     pub timestamp: i64,
 }

@@ -19,6 +19,8 @@ pub struct RegisterVaultParams {
     pub lockout_seconds: u32,
     /// Separate key for breaker reset/trip. If Pubkey::default(), uses policy_authority.
     pub breaker_authority: Pubkey,
+    /// Delay before policy loosening takes effect. 0 = no timelock.
+    pub policy_change_delay: u32,
 }
 
 #[derive(Accounts)]
@@ -101,6 +103,10 @@ pub fn handler(ctx: Context<RegisterVault>, params: RegisterVaultParams) -> Resu
     policy.auto_tripped = false;
     policy.trip_count = 0;
     policy.paused = false;
+    policy.policy_change_delay = params.policy_change_delay;
+    policy.pending_max_single_outflow_bps = 0;
+    policy.pending_cooldown_seconds = 0;
+    policy.pending_change_at = 0;
     policy.bump = ctx.bumps.vault_policy;
 
     // Initialize window configs and states

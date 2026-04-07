@@ -76,25 +76,17 @@ fn send_err(svm: &mut LiteSVM, ixs: &[Instruction], signers: &[&Keypair]) {
     assert!(send_tx(svm, ixs, signers).is_err(), "transaction should fail");
 }
 
-/// Send check_outflow and return the result code (0=allowed, 1+=blocked).
-fn check_outflow_code(
+/// Send check_outflow. Returns true if allowed, false if blocked.
+fn check_outflow_allowed(
     svm: &mut LiteSVM,
     program_id: &Pubkey,
     policy_authority: &Keypair,
     vault: &Pubkey,
     amount: u64,
     tvl: u64,
-) -> u8 {
+) -> bool {
     let ix = ix_check_outflow(program_id, &policy_authority.pubkey(), vault, amount, tvl);
-    let data = send_tx(svm, &[ix], &[policy_authority]).expect("check_outflow should not error");
-    // Anchor return data: first 8 bytes are discriminator, then the actual data
-    if data.len() > 8 {
-        data[8]
-    } else if !data.is_empty() {
-        data[0]
-    } else {
-        255 // unexpected
-    }
+    send_tx(svm, &[ix], &[policy_authority]).is_ok()
 }
 
 fn global_state_pda(program_id: &Pubkey) -> Pubkey {
@@ -128,6 +120,7 @@ fn ix_register_vault(
     max_single_outflow_bps: u16,
     cooldown_seconds: u32,
     lockout_seconds: u32,
+    policy_change_delay: u32,
 ) -> Instruction {
     let params = solana_circuit_breaker::RegisterVaultParams {
         windows,
@@ -135,6 +128,7 @@ fn ix_register_vault(
         cooldown_seconds,
         lockout_seconds,
         breaker_authority: *breaker_authority,
+        policy_change_delay,
     };
     Instruction::new_with_bytes(
         *program_id,
@@ -210,7 +204,7 @@ fn setup_with_vault(svm: &mut LiteSVM, admin: &Keypair, program_id: &Pubkey) -> 
     send_ok(svm, &[ix_register_vault(
         program_id, &admin.pubkey(), &vault.pubkey(), &token_mint.pubkey(), &breaker_auth.pubkey(),
         vec![WindowConfig { window_seconds: 300, max_outflow_bps: 1000 }],
-        500, 300, 600,
+        500, 300, 600, 0,
     )], &[admin]);
 
     (vault, token_mint, breaker_auth)
@@ -248,7 +242,7 @@ fn test_register_vault_rejects_empty_windows() {
     let (mut svm, admin, pid) = setup();
     send_ok(&mut svm, &[ix_initialize(&pid, &admin.pubkey())], &[&admin]);
     let v = Keypair::new(); let m = Keypair::new();
-    send_err(&mut svm, &[ix_register_vault(&pid, &admin.pubkey(), &v.pubkey(), &m.pubkey(), &admin.pubkey(), vec![], 500, 300, 600)], &[&admin]);
+    send_err(&mut svm, &[ix_register_vault(&pid, &admin.pubkey(), &v.pubkey(), &m.pubkey(), &admin.pubkey(), vec![], 500, 300, 600, 0)], &[&admin]);
 }
 
 #[test]
@@ -257,7 +251,7 @@ fn test_register_vault_rejects_zero_window_seconds() {
     send_ok(&mut svm, &[ix_initialize(&pid, &admin.pubkey())], &[&admin]);
     let v = Keypair::new(); let m = Keypair::new();
     send_err(&mut svm, &[ix_register_vault(&pid, &admin.pubkey(), &v.pubkey(), &m.pubkey(), &admin.pubkey(),
-        vec![WindowConfig { window_seconds: 0, max_outflow_bps: 1000 }], 500, 300, 600)], &[&admin]);
+        vec![WindowConfig { window_seconds: 0, max_outflow_bps: 1000 }], 500, 300, 600, 0)], &[&admin]);
 }
 
 #[test]
@@ -266,7 +260,7 @@ fn test_register_vault_rejects_zero_bps() {
     send_ok(&mut svm, &[ix_initialize(&pid, &admin.pubkey())], &[&admin]);
     let v = Keypair::new(); let m = Keypair::new();
     send_err(&mut svm, &[ix_register_vault(&pid, &admin.pubkey(), &v.pubkey(), &m.pubkey(), &admin.pubkey(),
-        vec![WindowConfig { window_seconds: 300, max_outflow_bps: 0 }], 500, 300, 600)], &[&admin]);
+        vec![WindowConfig { window_seconds: 300, max_outflow_bps: 0 }], 500, 300, 600, 0)], &[&admin]);
 }
 
 #[test]
@@ -275,7 +269,7 @@ fn test_register_vault_rejects_over_10000_bps() {
     send_ok(&mut svm, &[ix_initialize(&pid, &admin.pubkey())], &[&admin]);
     let v = Keypair::new(); let m = Keypair::new();
     send_err(&mut svm, &[ix_register_vault(&pid, &admin.pubkey(), &v.pubkey(), &m.pubkey(), &admin.pubkey(),
-        vec![WindowConfig { window_seconds: 300, max_outflow_bps: 10001 }], 500, 300, 600)], &[&admin]);
+        vec![WindowConfig { window_seconds: 300, max_outflow_bps: 10001 }], 500, 300, 600, 0)], &[&admin]);
 }
 
 #[test]
@@ -289,7 +283,7 @@ fn test_register_vault_rejects_more_than_3_windows() {
             WindowConfig { window_seconds: 300, max_outflow_bps: 1000 },
             WindowConfig { window_seconds: 3600, max_outflow_bps: 2500 },
             WindowConfig { window_seconds: 86400, max_outflow_bps: 5000 },
-        ], 500, 300, 600)], &[&admin]);
+        ], 500, 300, 600, 0)], &[&admin]);
 }
 
 // ===========================================================================
@@ -301,7 +295,7 @@ fn test_small_withdrawal_allowed() {
     let (mut svm, admin, pid) = setup();
     let (vault, _, _) = setup_with_vault(&mut svm, &admin, &pid);
     set_clock(&mut svm, 1000);
-    assert_eq!(check_outflow_code(&mut svm, &pid, &admin, &vault.pubkey(), 10_000, 1_000_000), 0);
+    assert!(check_outflow_allowed(&mut svm, &pid, &admin, &vault.pubkey(), 10_000, 1_000_000));
 }
 
 #[test]
@@ -311,7 +305,7 @@ fn test_multiple_small_withdrawals_allowed() {
     set_clock(&mut svm, 1000);
     // 3 x 3% = 9%, under 10% window
     for i in 0..3 {
-        assert_eq!(check_outflow_code(&mut svm, &pid, &admin, &vault.pubkey(), 30_000, 1_000_000), 0, "withdrawal {} should pass", i);
+        assert_eq!(check_outflow_allowed(&mut svm, &pid, &admin, &vault.pubkey(), 30_000, 1_000_000), true, "withdrawal {} should pass", i);
     }
 }
 
@@ -344,7 +338,7 @@ fn test_single_tx_over_limit_trips() {
     let (vault, _, _) = setup_with_vault(&mut svm, &admin, &pid);
     set_clock(&mut svm, 1000);
     // 6% > 5% single limit → blocked, code 2
-    assert_eq!(check_outflow_code(&mut svm, &pid, &admin, &vault.pubkey(), 60_000, 1_000_000), 2);
+    assert_eq!(check_outflow_allowed(&mut svm, &pid, &admin, &vault.pubkey(), 60_000, 1_000_000), false);
 }
 
 #[test]
@@ -353,7 +347,7 @@ fn test_single_tx_at_exact_limit_passes() {
     let (vault, _, _) = setup_with_vault(&mut svm, &admin, &pid);
     set_clock(&mut svm, 1000);
     // Exactly 5% → 50_000 of 1_000_000 → should pass
-    assert_eq!(check_outflow_code(&mut svm, &pid, &admin, &vault.pubkey(), 50_000, 1_000_000), 0);
+    assert!(check_outflow_allowed(&mut svm, &pid, &admin, &vault.pubkey(), 50_000, 1_000_000));
 }
 
 // ===========================================================================
@@ -367,10 +361,10 @@ fn test_window_rate_limit_trips() {
     set_clock(&mut svm, 1000);
     // 3 x 3% = 9% ok
     for _ in 0..3 {
-        assert_eq!(check_outflow_code(&mut svm, &pid, &admin, &vault.pubkey(), 30_000, 1_000_000), 0);
+        assert!(check_outflow_allowed(&mut svm, &pid, &admin, &vault.pubkey(), 30_000, 1_000_000));
     }
-    // 4th: 2% more = 11% → over 10% → blocked, code 3
-    assert_eq!(check_outflow_code(&mut svm, &pid, &admin, &vault.pubkey(), 20_000, 1_000_000), 3);
+    // 4th: 2% more = 11% → over 10% → blocked
+    assert!(!check_outflow_allowed(&mut svm, &pid, &admin, &vault.pubkey(), 20_000, 1_000_000));
 }
 
 #[test]
@@ -380,27 +374,25 @@ fn test_window_resets_after_expiry() {
     set_clock(&mut svm, 1000);
     // Use 9% of the 10% window
     for _ in 0..3 {
-        assert_eq!(check_outflow_code(&mut svm, &pid, &admin, &vault.pubkey(), 30_000, 1_000_000), 0);
+        assert!(check_outflow_allowed(&mut svm, &pid, &admin, &vault.pubkey(), 30_000, 1_000_000));
     }
     // Fast forward past 300s window
     set_clock(&mut svm, 1000 + 301);
     // Window reset — 3% should work
-    assert_eq!(check_outflow_code(&mut svm, &pid, &admin, &vault.pubkey(), 30_000, 1_000_000), 0);
+    assert!(check_outflow_allowed(&mut svm, &pid, &admin, &vault.pubkey(), 30_000, 1_000_000));
 }
 
 #[test]
 fn test_exact_window_limit_passes() {
     let (mut svm, admin, pid) = setup();
-    // Register vault with 10% single tx limit (matching window limit)
     send_ok(&mut svm, &[ix_initialize(&pid, &admin.pubkey())], &[&admin]);
     let vault = Keypair::new(); let mint = Keypair::new();
     send_ok(&mut svm, &[ix_register_vault(&pid, &admin.pubkey(), &vault.pubkey(), &mint.pubkey(), &admin.pubkey(),
         vec![WindowConfig { window_seconds: 300, max_outflow_bps: 1000 }],
-        1000, // 10% single tx limit (same as window)
-        300, 600)], &[&admin]);
+        1000, 300, 600, 0)], &[&admin]);
     set_clock(&mut svm, 1000);
-    // Exactly 10% = 100_000 of 1_000_000 → at limit, should pass
-    assert_eq!(check_outflow_code(&mut svm, &pid, &admin, &vault.pubkey(), 100_000, 1_000_000), 0);
+    // Exactly 10% → at limit, should pass
+    assert!(check_outflow_allowed(&mut svm, &pid, &admin, &vault.pubkey(), 100_000, 1_000_000));
 }
 
 #[test]
@@ -409,7 +401,7 @@ fn test_one_over_window_limit_trips() {
     let (vault, _, _) = setup_with_vault(&mut svm, &admin, &pid);
     set_clock(&mut svm, 1000);
     // 10% + 1 → trips
-    assert_ne!(check_outflow_code(&mut svm, &pid, &admin, &vault.pubkey(), 100_001, 1_000_000), 0);
+    assert_eq!(check_outflow_allowed(&mut svm, &pid, &admin, &vault.pubkey(), 100_001, 1_000_000), false);
 }
 
 // ===========================================================================
@@ -419,30 +411,27 @@ fn test_one_over_window_limit_trips() {
 #[test]
 fn test_tripped_breaker_blocks_subsequent_outflows() {
     let (mut svm, admin, pid) = setup();
-    let (vault, _, _) = setup_with_vault(&mut svm, &admin, &pid);
+    let (vault, _, breaker_auth) = setup_with_vault(&mut svm, &admin, &pid);
     set_clock(&mut svm, 1000);
-    // Trip via single tx
-    assert_eq!(check_outflow_code(&mut svm, &pid, &admin, &vault.pubkey(), 60_000, 1_000_000), 2);
-    // Now even 1 token should return blocked (code 1 = already tripped)
-    assert_eq!(check_outflow_code(&mut svm, &pid, &admin, &vault.pubkey(), 1, 1_000_000), 1);
+    // Manually trip the breaker
+    send_ok(&mut svm, &[ix_trip_breaker(&pid, &breaker_auth.pubkey(), &vault.pubkey())], &[&breaker_auth]);
+    // Even 1 token should be blocked
+    assert!(!check_outflow_allowed(&mut svm, &pid, &admin, &vault.pubkey(), 1, 1_000_000));
 }
 
 #[test]
-fn test_breaker_auto_resets_after_lockout() {
+fn test_manual_trip_auto_resets_after_cooldown() {
     let (mut svm, admin, pid) = setup();
-    let (vault, _, _) = setup_with_vault(&mut svm, &admin, &pid);
+    let (vault, _, breaker_auth) = setup_with_vault(&mut svm, &admin, &pid);
     set_clock(&mut svm, 1000);
-    // Trip
-    assert_eq!(check_outflow_code(&mut svm, &pid, &admin, &vault.pubkey(), 60_000, 1_000_000), 2);
-    // Still blocked during lockout (600s), even past cooldown (300s)
+    // Manual trip
+    send_ok(&mut svm, &[ix_trip_breaker(&pid, &breaker_auth.pubkey(), &vault.pubkey())], &[&breaker_auth]);
+    // Still blocked during cooldown
+    set_clock(&mut svm, 1000 + 299);
+    assert!(!check_outflow_allowed(&mut svm, &pid, &admin, &vault.pubkey(), 1, 1_000_000));
+    // After cooldown (300s) — auto reset
     set_clock(&mut svm, 1000 + 301);
-    assert_eq!(check_outflow_code(&mut svm, &pid, &admin, &vault.pubkey(), 1, 1_000_000), 1);
-    // Still blocked at lockout - 1
-    set_clock(&mut svm, 1000 + 599);
-    assert_eq!(check_outflow_code(&mut svm, &pid, &admin, &vault.pubkey(), 1, 1_000_000), 1);
-    // After lockout — auto reset, allowed
-    set_clock(&mut svm, 1000 + 601);
-    assert_eq!(check_outflow_code(&mut svm, &pid, &admin, &vault.pubkey(), 1_000, 1_000_000), 0);
+    assert!(check_outflow_allowed(&mut svm, &pid, &admin, &vault.pubkey(), 1_000, 1_000_000));
 }
 
 // ===========================================================================
@@ -455,7 +444,7 @@ fn test_manual_trip_blocks_outflows() {
     let (vault, _, breaker_auth) = setup_with_vault(&mut svm, &admin, &pid);
     set_clock(&mut svm, 1000);
     send_ok(&mut svm, &[ix_trip_breaker(&pid, &breaker_auth.pubkey(), &vault.pubkey())], &[&breaker_auth]);
-    assert_eq!(check_outflow_code(&mut svm, &pid, &admin, &vault.pubkey(), 1, 1_000_000), 1);
+    assert_eq!(check_outflow_allowed(&mut svm, &pid, &admin, &vault.pubkey(), 1, 1_000_000), false);
 }
 
 #[test]
@@ -468,7 +457,7 @@ fn test_manual_trip_reset_immediately() {
     // Reset immediately — no lockout for manual trips
     send_ok(&mut svm, &[ix_reset_breaker(&pid, &breaker_auth.pubkey(), &vault.pubkey())], &[&breaker_auth]);
     // Outflow works
-    assert_eq!(check_outflow_code(&mut svm, &pid, &admin, &vault.pubkey(), 1_000, 1_000_000), 0);
+    assert!(check_outflow_allowed(&mut svm, &pid, &admin, &vault.pubkey(), 1_000, 1_000_000));
 }
 
 #[test]
@@ -504,7 +493,7 @@ fn test_breaker_authority_cannot_update_policy() {
     let (mut svm, admin, pid) = setup();
     let (vault, _, breaker_auth) = setup_with_vault(&mut svm, &admin, &pid);
     let params = solana_circuit_breaker::UpdatePolicyParams {
-        windows: None, max_single_outflow_bps: Some(9999), cooldown_seconds: None, lockout_seconds: None, paused: None,
+        windows: None, max_single_outflow_bps: Some(9999), cooldown_seconds: None, lockout_seconds: None, paused: None, policy_change_delay: None,
     };
     send_err(&mut svm, &[ix_update_policy(&pid, &breaker_auth.pubkey(), &vault.pubkey(), params)], &[&breaker_auth]);
 }
@@ -525,34 +514,46 @@ fn test_random_key_cannot_check_outflow() {
 // ===========================================================================
 
 #[test]
-fn test_auto_trip_lockout_blocks_reset() {
+fn test_manual_trip_can_be_reset_immediately_no_lockout() {
+    // Manual trips set auto_tripped=false, so no lockout applies
     let (mut svm, admin, pid) = setup();
     let (vault, _, breaker_auth) = setup_with_vault(&mut svm, &admin, &pid);
     set_clock(&mut svm, 1000);
-    // Trigger auto-trip
-    check_outflow_code(&mut svm, &pid, &admin, &vault.pubkey(), 60_000, 1_000_000);
-    // Reset blocked during lockout
-    send_err(&mut svm, &[ix_reset_breaker(&pid, &breaker_auth.pubkey(), &vault.pubkey())], &[&breaker_auth]);
-}
-
-#[test]
-fn test_auto_trip_lockout_blocks_reset_at_599s() {
-    let (mut svm, admin, pid) = setup();
-    let (vault, _, breaker_auth) = setup_with_vault(&mut svm, &admin, &pid);
-    set_clock(&mut svm, 1000);
-    check_outflow_code(&mut svm, &pid, &admin, &vault.pubkey(), 60_000, 1_000_000);
-    set_clock(&mut svm, 1000 + 599);
-    send_err(&mut svm, &[ix_reset_breaker(&pid, &breaker_auth.pubkey(), &vault.pubkey())], &[&breaker_auth]);
-}
-
-#[test]
-fn test_auto_trip_lockout_allows_reset_after_expiry() {
-    let (mut svm, admin, pid) = setup();
-    let (vault, _, breaker_auth) = setup_with_vault(&mut svm, &admin, &pid);
-    set_clock(&mut svm, 1000);
-    check_outflow_code(&mut svm, &pid, &admin, &vault.pubkey(), 60_000, 1_000_000);
-    set_clock(&mut svm, 1000 + 601);
+    send_ok(&mut svm, &[ix_trip_breaker(&pid, &breaker_auth.pubkey(), &vault.pubkey())], &[&breaker_auth]);
+    // Reset works immediately for manual trips
     send_ok(&mut svm, &[ix_reset_breaker(&pid, &breaker_auth.pubkey(), &vault.pubkey())], &[&breaker_auth]);
+}
+
+#[test]
+fn test_window_cumulative_prevents_drain_without_trip_state() {
+    // Even though check_outflow errors don't persist trip state,
+    // the cumulative outflow from SUCCESSFUL calls prevents further draining
+    let (mut svm, admin, pid) = setup();
+    let (vault, _, _) = setup_with_vault(&mut svm, &admin, &pid);
+    set_clock(&mut svm, 1000);
+    // 3 x 3% = 9% — each call succeeds and persists cumulative
+    for _ in 0..3 {
+        assert!(check_outflow_allowed(&mut svm, &pid, &admin, &vault.pubkey(), 30_000, 1_000_000));
+    }
+    // 4th fails — cumulative 12% > 10% window. Error rolls back, but
+    // the 9% from previous calls persists, so attacker can't drain more
+    assert!(!check_outflow_allowed(&mut svm, &pid, &admin, &vault.pubkey(), 30_000, 1_000_000));
+    // Even smaller amounts fail if they push over 10%
+    assert!(!check_outflow_allowed(&mut svm, &pid, &admin, &vault.pubkey(), 20_000, 1_000_000));
+    // But amounts that stay under 10% still work
+    assert!(check_outflow_allowed(&mut svm, &pid, &admin, &vault.pubkey(), 10_000, 1_000_000));
+}
+
+#[test]
+fn test_single_tx_limit_rejects_but_allows_smaller() {
+    // Single tx limit errors don't persist, but they prevent the large withdrawal
+    let (mut svm, admin, pid) = setup();
+    let (vault, _, _) = setup_with_vault(&mut svm, &admin, &pid);
+    set_clock(&mut svm, 1000);
+    // 6% blocked (single tx limit 5%)
+    assert!(!check_outflow_allowed(&mut svm, &pid, &admin, &vault.pubkey(), 60_000, 1_000_000));
+    // But 4% still works — no trip state persisted
+    assert!(check_outflow_allowed(&mut svm, &pid, &admin, &vault.pubkey(), 40_000, 1_000_000));
 }
 
 // ===========================================================================
@@ -566,11 +567,11 @@ fn test_update_policy_loosens_limit() {
     set_clock(&mut svm, 1000);
     // Loosen single tx to 50%
     let params = solana_circuit_breaker::UpdatePolicyParams {
-        windows: None, max_single_outflow_bps: Some(5000), cooldown_seconds: None, lockout_seconds: None, paused: None,
+        windows: None, max_single_outflow_bps: Some(5000), cooldown_seconds: None, lockout_seconds: None, paused: None, policy_change_delay: None,
     };
     send_ok(&mut svm, &[ix_update_policy(&pid, &admin.pubkey(), &vault.pubkey(), params)], &[&admin]);
-    // 6% now passes
-    assert_eq!(check_outflow_code(&mut svm, &pid, &admin, &vault.pubkey(), 60_000, 1_000_000), 0);
+    // 6% now passes (no policy_change_delay so loosening is immediate)
+    assert!(check_outflow_allowed(&mut svm, &pid, &admin, &vault.pubkey(), 60_000, 1_000_000));
 }
 
 #[test]
@@ -579,10 +580,10 @@ fn test_pause_blocks_outflows() {
     let (vault, _, _) = setup_with_vault(&mut svm, &admin, &pid);
     set_clock(&mut svm, 1000);
     let params = solana_circuit_breaker::UpdatePolicyParams {
-        windows: None, max_single_outflow_bps: None, cooldown_seconds: None, lockout_seconds: None, paused: Some(true),
+        windows: None, max_single_outflow_bps: None, cooldown_seconds: None, lockout_seconds: None, paused: Some(true), policy_change_delay: None,
     };
     send_ok(&mut svm, &[ix_update_policy(&pid, &admin.pubkey(), &vault.pubkey(), params)], &[&admin]);
-    assert_eq!(check_outflow_code(&mut svm, &pid, &admin, &vault.pubkey(), 1, 1_000_000), 4); // paused code
+    assert_eq!(check_outflow_allowed(&mut svm, &pid, &admin, &vault.pubkey(), 1, 1_000_000), false); // paused
 }
 
 #[test]
@@ -592,11 +593,11 @@ fn test_unpause_resumes_outflows() {
     set_clock(&mut svm, 1000);
     for paused in [true, false] {
         let params = solana_circuit_breaker::UpdatePolicyParams {
-            windows: None, max_single_outflow_bps: None, cooldown_seconds: None, lockout_seconds: None, paused: Some(paused),
+            windows: None, max_single_outflow_bps: None, cooldown_seconds: None, lockout_seconds: None, paused: Some(paused), policy_change_delay: None,
         };
         send_ok(&mut svm, &[ix_update_policy(&pid, &admin.pubkey(), &vault.pubkey(), params)], &[&admin]);
     }
-    assert_eq!(check_outflow_code(&mut svm, &pid, &admin, &vault.pubkey(), 1_000, 1_000_000), 0);
+    assert!(check_outflow_allowed(&mut svm, &pid, &admin, &vault.pubkey(), 1_000, 1_000_000));
 }
 
 // ===========================================================================
@@ -611,8 +612,7 @@ fn test_attack_drain_capped_at_10_percent() {
     let tvl = 1_000_000u64;
     let mut total_drained = 0u64;
     for _ in 0..100 {
-        let code = check_outflow_code(&mut svm, &pid, &admin, &vault.pubkey(), 49_000, tvl);
-        if code == 0 {
+        if check_outflow_allowed(&mut svm, &pid, &admin, &vault.pubkey(), 49_000, tvl) {
             total_drained += 49_000;
         } else {
             break;
@@ -627,7 +627,7 @@ fn test_attack_compromised_policy_key_cannot_reset_auto_trip() {
     let (mut svm, admin, pid) = setup();
     let (vault, _, breaker_auth) = setup_with_vault(&mut svm, &admin, &pid);
     set_clock(&mut svm, 1000);
-    check_outflow_code(&mut svm, &pid, &admin, &vault.pubkey(), 60_000, 1_000_000);
+    check_outflow_allowed(&mut svm, &pid, &admin, &vault.pubkey(), 60_000, 1_000_000);
     // policy_authority can't reset
     send_err(&mut svm, &[ix_reset_breaker(&pid, &admin.pubkey(), &vault.pubkey())], &[&admin]);
     // breaker_authority can't reset during lockout
@@ -635,18 +635,34 @@ fn test_attack_compromised_policy_key_cannot_reset_auto_trip() {
 }
 
 #[test]
-fn test_attack_loosen_limits_then_drain() {
+fn test_attack_loosen_windows_rejected() {
     let (mut svm, admin, pid) = setup();
     let (vault, _, _) = setup_with_vault(&mut svm, &admin, &pid);
     set_clock(&mut svm, 1000);
-    // Attacker has policy key, loosens to 100%
+    // Attacker has policy key, tries to loosen windows to 100%
+    // This is now rejected — window loosening requires re-registration
     let params = solana_circuit_breaker::UpdatePolicyParams {
         windows: Some(vec![WindowConfig { window_seconds: 300, max_outflow_bps: 10000 }]),
-        max_single_outflow_bps: Some(10000), cooldown_seconds: None, lockout_seconds: None, paused: None,
+        max_single_outflow_bps: None, cooldown_seconds: None, lockout_seconds: None, paused: None, policy_change_delay: None,
+    };
+    send_err(&mut svm, &[ix_update_policy(&pid, &admin.pubkey(), &vault.pubkey(), params)], &[&admin]);
+}
+
+#[test]
+fn test_tightening_windows_allowed() {
+    let (mut svm, admin, pid) = setup();
+    let (vault, _, _) = setup_with_vault(&mut svm, &admin, &pid);
+    set_clock(&mut svm, 1000);
+    // Tightening from 10% to 5% — should work immediately
+    let params = solana_circuit_breaker::UpdatePolicyParams {
+        windows: Some(vec![WindowConfig { window_seconds: 300, max_outflow_bps: 500 }]),
+        max_single_outflow_bps: None, cooldown_seconds: None, lockout_seconds: None, paused: None, policy_change_delay: None,
     };
     send_ok(&mut svm, &[ix_update_policy(&pid, &admin.pubkey(), &vault.pubkey(), params)], &[&admin]);
-    // Can drain 100% — known limitation
-    assert_eq!(check_outflow_code(&mut svm, &pid, &admin, &vault.pubkey(), 1_000_000, 1_000_000), 0);
+    // Now 4% should fail (was ok before at 10%, now 5% window)
+    assert!(check_outflow_allowed(&mut svm, &pid, &admin, &vault.pubkey(), 40_000, 1_000_000));
+    // But 2% more = 6% > 5% should fail
+    assert!(!check_outflow_allowed(&mut svm, &pid, &admin, &vault.pubkey(), 20_000, 1_000_000));
 }
 
 // ===========================================================================
@@ -662,12 +678,12 @@ fn test_tightest_window_wins() {
         vec![
             WindowConfig { window_seconds: 60, max_outflow_bps: 500 },   // 5% per 60s
             WindowConfig { window_seconds: 3600, max_outflow_bps: 2000 }, // 20% per 1h
-        ], 1000, 300, 600)], &[&admin]);
+        ], 1000, 300, 600, 0)], &[&admin]);
     set_clock(&mut svm, 1000);
     // 4% — under both
-    assert_eq!(check_outflow_code(&mut svm, &pid, &admin, &vault.pubkey(), 40_000, 1_000_000), 0);
+    assert!(check_outflow_allowed(&mut svm, &pid, &admin, &vault.pubkey(), 40_000, 1_000_000));
     // 2% more = 6% → over window 1 (5%) but under window 2 (20%)
-    assert_ne!(check_outflow_code(&mut svm, &pid, &admin, &vault.pubkey(), 20_000, 1_000_000), 0);
+    assert!(!check_outflow_allowed(&mut svm, &pid, &admin, &vault.pubkey(), 20_000, 1_000_000));
 }
 
 // ===========================================================================
@@ -679,5 +695,5 @@ fn test_large_tvl_no_overflow() {
     let (mut svm, admin, pid) = setup();
     let (vault, _, _) = setup_with_vault(&mut svm, &admin, &pid);
     set_clock(&mut svm, 1000);
-    assert_eq!(check_outflow_code(&mut svm, &pid, &admin, &vault.pubkey(), 1000, u64::MAX / 2), 0);
+    assert!(check_outflow_allowed(&mut svm, &pid, &admin, &vault.pubkey(), 1000, u64::MAX / 2));
 }
