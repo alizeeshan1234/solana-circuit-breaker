@@ -31,8 +31,10 @@ Attack day:
 - **Lockout mode** — When auto-tripped, nobody can reset the breaker for a configurable period (default 1 hour), even with admin keys. Protects against compromised admin scenarios.
 - **Role separation** — Two separate authorities: `policy_authority` (manages config) and `breaker_authority` (trips/resets). Compromising one key doesn't give full control.
 - **Manual panic button** — `breaker_authority` can trip the breaker instantly in an emergency
+- **Timelock on policy changes** — Loosening window limits is rejected outright. Loosening single-tx limits is queued and only takes effect after a configurable delay. Tightening is always immediate. Prevents instant limit removal by a compromised admin.
+- **Authority migration** — `transfer_authority` instruction allows migrating both policy and breaker keys to new addresses if a key is compromised
 - **Auto-reset** — After cooldown expires, the breaker resets automatically
-- **Events** — Emits events on every trip, reset, and successful outflow check for off-chain monitoring
+- **Events** — Emits events on every trip, reset, policy change, and authority transfer for off-chain monitoring
 
 ## Architecture
 
@@ -49,6 +51,7 @@ Attack day:
 - `windows` — Rate limit window configurations
 - `window_states` — Rolling outflow tracking per window
 - `lockout_seconds` — Minimum time after auto-trip where nobody can reset
+- `policy_change_delay` — Timelock delay before policy loosening takes effect
 - `tripped` / `auto_tripped` — Current breaker state
 
 ### Instructions
@@ -60,7 +63,9 @@ Attack day:
 | `check_outflow` | Protocol (every withdrawal) | Checks if a withdrawal is allowed. Auto-trips if limits exceeded. |
 | `trip_breaker` | `breaker_authority` | Manual emergency freeze |
 | `reset_breaker` | `breaker_authority` | Manual reset (blocked during lockout for auto-trips) |
-| `update_policy` | `policy_authority` | Update windows, limits, cooldown, lockout, or pause |
+| `update_policy` | `policy_authority` | Update windows, limits, cooldown, lockout, or pause. Loosening is queued with timelock. |
+| `execute_pending_policy` | `policy_authority` | Apply queued policy loosening after timelock delay elapses |
+| `transfer_authority` | `policy_authority` | Migrate policy_authority and/or breaker_authority to new keys |
 
 ### Security Model
 
@@ -79,6 +84,14 @@ Auto-trip (exploit detected)  → locked for 1 hour, nobody can reset
 Manual trip (panic button)    → breaker_authority can reset immediately
 ```
 If admin keys are compromised and the attacker drains 10%, the breaker auto-trips and locks for 1 hour. The attacker can't reset it even with all the keys. The team has 1 hour to respond.
+
+**Timelock on policy changes:**
+```
+Tightening limits  → applies immediately (safer direction)
+Loosening limits   → queued, takes effect after policy_change_delay
+Loosening windows  → rejected entirely (re-register to change)
+```
+Attacker steals the policy key and tries to loosen limits? The change is queued. The team has hours to notice and transfer authority to a new key before it takes effect.
 
 ## Integration Guide
 
@@ -121,6 +134,7 @@ let params = RegisterVaultParams {
     cooldown_seconds: 300,         // 5 min cooldown after trip
     lockout_seconds: 3600,         // 1 hour lockout on auto-trip
     breaker_authority: your_multisig_key, // separate key for breaker control
+    policy_change_delay: 3600,             // 1 hour delay before policy loosening takes effect
 };
 
 let cpi_accounts = RegisterVault {
