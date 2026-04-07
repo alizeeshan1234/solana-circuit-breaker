@@ -88,12 +88,17 @@ In your protocol's `Cargo.toml`:
 
 ```toml
 [dependencies]
-# Via git (recommended until crate is published)
-solana-circuit-breaker = { git = "https://github.com/alizeeshan1234/solana-circuit-breaker", features = ["cpi"] }
+# Anchor 1.0.0 (solana 3.x)
+solana-circuit-breaker = { git = "https://github.com/alizeeshan1234/solana-circuit-breaker", branch = "main", features = ["cpi"] }
+
+# Anchor 0.32.1 (solana 2.x)
+solana-circuit-breaker = { git = "https://github.com/alizeeshan1234/solana-circuit-breaker", branch = "anchor-032", features = ["cpi"] }
 
 # Or local path (for development)
 # solana-circuit-breaker = { path = "../solana-circuit-breaker/programs/solana-circuit-breaker", features = ["cpi"] }
 ```
+
+The program code is identical across both branches — only the Anchor/Solana dependency versions differ. Pick the branch that matches your project's Anchor version.
 
 ### Step 2: Register your vault
 
